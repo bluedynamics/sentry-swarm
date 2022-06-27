@@ -129,7 +129,7 @@ services:
     volumes:
       - "zookeeper:/var/lib/zookeeper/data"
       - "zookeeper-log:/var/lib/zookeeper/log"
-      - "secrets:/etc/zookeeper/secrets"
+      - "zookeeper-secrets:/etc/zookeeper/secrets"
     healthcheck:
       <<: *healthcheck_defaults
       test:
@@ -452,9 +452,7 @@ services:
       - --providers.docker.constraints=Label(`traefik.constraint-label`, `traefik-public`)
       # Do not expose all Docker services, only the ones explicitly exposed
       - --providers.docker.exposedbydefault=false
-      # Enable Docker Swarm mode
-      - --providers.docker.swarmmode
-      # Create an entrypoint "http" listening on address 80
+      # Enable Docker Swarmgeoip.conft "http" listening on address 80
       - --entrypoints.http.address=:80
       # Create an entrypoint "https" listening on address 80
       - --entrypoints.https.address=:443
@@ -496,6 +494,7 @@ volumes:
   traefik-access-log:
   kafka-secrets:
   zookeeper-log:
+  zookeeper-secrets:
   kafka-log:
   clickhouse-log:
 
