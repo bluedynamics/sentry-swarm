@@ -463,9 +463,7 @@ services:
       # Use the staging acme server for initial testing
       # - "--certificatesresolvers.le.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
       # Store the Let's Encrypt certificates in the mounted volume
-      - --certificatesresolvers.le.acme.storage=/certificates/acme.json
-      # Use the TLS Challenge for Let's Encrypt
-      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.storage=/certifrelay.ymlue
       # Enable the access log, with HTTP requests
       - --accesslog=true
       - --accesslog.filepath=/acccesslog/access.log
@@ -504,13 +502,13 @@ volumes:
 configs:
   clickhouse:
     name: clickhouse-config.xml
-    file: ./clickhouse/config.xml
+    file: ./config//clickhouse.xml
   symbolicator:
     name: symbolicator-config.yml
-    file: ./symbolicator/config.yml
+    file: ./config/symbolicator.yml
   relay:
     name: relay-config.yml
-    file: ./relay/config.yml
+    file: ./config/relay.yml
   geoip:
     name: geoip.conf
     file: ./geoip/geoip.conf
