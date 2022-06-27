@@ -1,0 +1,516 @@
+version: "3.8"
+
+############################################################################################
+# MACROS
+############################################################################################
+
+x-healthcheck-defaults: &healthcheck_defaults
+  interval: "$HEALTHCHECK_INTERVAL"
+  timeout: "$HEALTHCHECK_TIMEOUT"
+  retries: 5
+  start_period: 10s
+
+x-sentry-defaults: &sentry_defaults
+  image: getsentry/sentry:nightly
+  depends_on:
+    - redis
+    - kafka
+    - postgres
+    - memcached
+    - smtp
+    - snuba-api
+    - snuba-consumer
+    - snuba-outcomes-consumer
+    - snuba-sessions-consumer
+    - snuba-transactions-consumer
+    - snuba-subscription-consumer-events
+    - snuba-subscription-consumer-transactions
+    - snuba-replacer
+    - symbolicator
+  entrypoint: "/etc/sentry/entrypoint.sh"
+  command: ["run", "web"]
+  environment:
+    SNUBA: "http://snuba-api:1218"
+    DEFAULT_CA_BUNDLE: &ca_bundle "/etc/ssl/certs/ca-certificates.crt"
+    REQUESTS_CA_BUNDLE: *ca_bundle
+    GRPC_DEFAULT_SSL_ROOTS_FILE_PATH_ENV_VAR: *ca_bundle
+    SENTRY_REDIS_HOST: redis
+    SENTRY_EVENT_RETENTION_DAYS: ${SENTRY_EVENT_RETENTION_DAYS}
+    SENTRY_EMAIL_HOST: ${EMAIL_HOST}
+    SENTRY_EMAIL_PORT: ${EMAIL_PORT}
+    SENTRY_EMAIL_USER: ${EMAIL_USER}
+    SENTRY_EMAIL_PASSWORD: ${EMAIL_PASSWORD}
+    SENTRY_EMAIL_USE_TLS: 1
+  volumes:
+    - "sentry-data:/data"
+    - "./geoip:/geoip:ro"
+    - "./certificates:/usr/local/share/ca-certificates:ro"
+
+x-snuba-defaults: &snuba_defaults
+  depends_on:
+    - clickhouse
+    - kafka
+    - redis
+  image: getsentry/snuba:nightly
+  environment:
+    SNUBA_SETTINGS: docker
+    CLICKHOUSE_HOST: clickhouse
+    DEFAULT_BROKERS: "kafka:9092"
+    REDIS_HOST: redis
+    UWSGI_MAX_REQUESTS: "10000"
+    UWSGI_DISABLE_LOGGING: "true"
+    SENTRY_EVENT_RETENTION_DAYS: ${SENTRY_EVENT_RETENTION_DAYS}
+
+############################################################################################
+# SERVICES
+############################################################################################
+
+services:
+  ############################################################################################
+  # CRON EXECUTOR
+  cronjob:
+    image: crazymax/swarm-cronjob:1
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    environment:
+      - "TZ=Europe/Paris"
+      - "LOG_LEVEL=info"
+      - "LOG_JSON=false"
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  ############################################################################################
+  # CACHE
+
+  memcached:
+    image: "memcached:1-alpine"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: echo stats | nc 127.0.0.1 11211
+
+  redis:
+    image: "redis:6-alpine"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: redis-cli ping
+    volumes:
+      - "redis:/data"
+    ulimits:
+      nofile:
+        soft: 10032
+        hard: 10032
+
+  ############################################################################################
+  # POSTGRES
+
+  postgres:
+    image: "postgres:14"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: "trust"
+    volumes:
+      - "postgres:/var/lib/postgresql/data"
+
+  ############################################################################################
+  # KAFKA
+
+  zookeeper:
+    image: "confluentinc/cp-zookeeper:7.0.2"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      CONFLUENT_SUPPORT_METRICS_ENABLE: "false"
+      ZOOKEEPER_LOG4J_ROOT_LOGLEVEL: "WARN"
+      ZOOKEEPER_TOOLS_LOG4J_LOGLEVEL: "WARN"
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok"
+    volumes:
+      - "zookeeper:/var/lib/zookeeper/data"
+      - "zookeeper-log:/var/lib/zookeeper/log"
+      - "secrets:/etc/zookeeper/secrets"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test:
+        ["CMD-SHELL", 'echo "ruok" | nc -w 2 -q 2 localhost 2181 | grep imok']
+
+  kafka:
+    depends_on:
+      - zookeeper
+    image: "confluentinc/cp-kafka:7.0.2"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "1"
+      KAFKA_LOG_RETENTION_HOURS: "24"
+      KAFKA_MESSAGE_MAX_BYTES: "50000000" #50MB or bust
+      KAFKA_MAX_REQUEST_SIZE: "50000000" #50MB on requests apparently too
+      CONFLUENT_SUPPORT_METRICS_ENABLE: "false"
+      KAFKA_LOG4J_LOGGERS: "kafka.cluster=WARN,kafka.controller=WARN,kafka.coordinator=WARN,kafka.log=WARN,kafka.server=WARN,kafka.zookeeper=WARN,state.change.logger=WARN"
+      KAFKA_LOG4J_ROOT_LOGLEVEL: "WARN"
+      KAFKA_TOOLS_LOG4J_LOGLEVEL: "WARN"
+    volumes:
+      - "kafka:/var/lib/kafka/data"
+      - "kafka-log:/var/lib/kafka/log"
+      - "kafka-secrets:/etc/kafka/secrets"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: ["CMD-SHELL", "nc -z localhost 9092"]
+
+  ############################################################################################
+  # CLICKHOUSE
+
+  clickhouse:
+    image: "yandex/clickhouse-server:22"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse:/var/lib/clickhouse"
+      - clickhouse-log:/var/log/clickhouse-server"
+    configs:
+      - source: clickhouse
+        target: /etc/clickhouse-server/config.d/sentry.xml
+    environment:
+      # This limits Clickhouse's memory to 30% of the host memory
+      # If you have high volume and your search return incomplete results
+      # You might want to change this to a higher value (and ensure your host has enough memory)
+      MAX_MEMORY_USAGE_RATIO: 0.3
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -nv -t1 --spider 'http://localhost:8123/' || exit 1",
+        ]
+      interval: 3s
+      timeout: 600s
+      retries: 200
+
+  ############################################################################################
+  # GEOIPUPDATES
+
+  geoipupdate:
+    image: "maxmindinc/geoipupdate:v4"
+    # Override the entrypoint in order to avoid using envvars for config.
+    # Futz with settings so we can keep mmdb and conf in same dir on host
+    # (image looks for them in separate dirs by default).
+    entrypoint:
+      ["/usr/bin/geoipupdate", "-d", "/sentry", "-f", "/sentry/GeoIP.conf"]
+    volumes:
+      - "./geoip:/sentry"
+
+  ############################################################################################
+  # SNUBA (KAFKA MICROSERVICES)
+
+  snuba-api:
+    <<: *snuba_defaults
+
+  # Kafka consumer responsible for feeding events into Clickhouse
+  snuba-consumer:
+    <<: *snuba_defaults
+    command: consumer --storage errors --auto-offset-reset=latest --max-batch-time-ms 750
+
+  # Kafka consumer responsible for feeding outcomes into Clickhouse
+  # Use --auto-offset-reset=earliest to recover up to 7 days of TSDB data
+  # since we did not do a proper migration
+  snuba-outcomes-consumer:
+    <<: *snuba_defaults
+    command: consumer --storage outcomes_raw --auto-offset-reset=earliest --max-batch-time-ms 750
+
+  # Kafka consumer responsible for feeding session data into Clickhouse
+  snuba-sessions-consumer:
+    <<: *snuba_defaults
+    command: consumer --storage sessions_raw --auto-offset-reset=latest --max-batch-time-ms 750
+
+  # Kafka consumer responsible for feeding transactions data into Clickhouse
+  snuba-transactions-consumer:
+    <<: *snuba_defaults
+    command: consumer --storage transactions --consumer-group transactions_group --auto-offset-reset=latest --max-batch-time-ms 750 --commit-log-topic=snuba-commit-log
+
+  snuba-replacer:
+    <<: *snuba_defaults
+    command: replacer --storage errors --auto-offset-reset=latest --max-batch-size 3
+
+  snuba-subscription-consumer-events:
+    <<: *snuba_defaults
+    command: subscriptions --auto-offset-reset=latest --consumer-group=snuba-events-subscriptions-consumers --topic=events --result-topic=events-subscription-results --dataset=events --commit-log-topic=snuba-commit-log --commit-log-group=snuba-consumers --delay-seconds=60 --schedule-ttl=60
+
+  snuba-subscription-consumer-transactions:
+    <<: *snuba_defaults
+    command: subscriptions --auto-offset-reset=latest --consumer-group=snuba-transactions-subscriptions-consumers --topic=events --result-topic=transactions-subscription-results --dataset=transactions --commit-log-topic=snuba-commit-log --commit-log-group=transactions_group --delay-seconds=60 --schedule-ttl=60
+
+  snuba-cron-cleanup:
+    <<: *snuba_defaults
+    command: "gosu snuba snuba cleanup --storage errors --dry-run False"
+    deploy:
+      mode: replicated
+      replicas: 0
+      labels:
+        - "swarm.cronjob.enable=true"
+        - "swarm.cronjob.schedule=*/5 * * * *"
+        - "swarm.cronjob.skip-running=false"
+      restart_policy:
+        condition: none
+
+  snuba-cron-transactions-cleanup:
+    <<: *snuba_defaults
+    command: "gosu snuba snuba cleanup --storage errors transactions --dry-run False"
+    deploy:
+      mode: replicated
+      replicas: 0
+      labels:
+        - "swarm.cronjob.enable=true"
+        - "swarm.cronjob.schedule=*/5 * * * *"
+        - "swarm.cronjob.skip-running=false"
+      restart_policy:
+        condition: none
+
+  ############################################################################################
+  # SYMBOLICATOR
+
+  symbolicator:
+    image: getsentry/symbolicator:nightly
+    volumes:
+      - symbolicator:/data"
+    configs:
+      - source: symbolicator
+        target: /etc/symbolicator/config.yml
+    command: run -c /etc/symbolicator/config.yml
+
+  symbolicator-cron-cleanup:
+    image: getsentry/symbolicator:nightly
+    command: "gosu symbolicator symbolicator cleanup"
+    volumes:
+      - symbolicator:/data"
+    deploy:
+      mode: replicated
+      replicas: 0
+      labels:
+        - "swarm.cronjob.enable=true"
+        - "swarm.cronjob.schedule=55 23 * * *"
+        - "swarm.cronjob.skip-running=false"
+      restart_policy:
+        condition: none
+
+  ############################################################################################
+  # SENTRY CORE
+
+  web:
+    <<: *sentry_defaults
+    healthcheck:
+      <<: *healthcheck_defaults
+      test:
+        - "CMD"
+        - "/bin/bash"
+        - "-c"
+        # Courtesy of https://unix.stackexchange.com/a/234089/108960
+        - 'exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e "GET /_health/ HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n" >&3 && grep ok -s -m 1 <&3'
+    deploy:
+      labels:
+        # TRAEFIK:
+        - traefik.enable=true
+        - traefik.constraint-label=traefik-public
+        # service
+        - traefik.http.services.sentry-web.loadbalancer.server.port=9000
+        # main router
+        - traefik.http.routers.sentry-web.rule=Host(`${SENTRY_DOMAIN?Unset}`)
+        - traefik.http.routers.sentry-web.entrypoints=https
+        - traefik.http.routers.sentry-web.tls=true
+        - traefik.http.routers.sentry-web.tls.certresolver=le
+        - traefik.http.routers.sentry-web.middlewares=gzip
+
+  worker:
+    <<: *sentry_defaults
+    command: run worker
+
+  ingest-consumer:
+    <<: *sentry_defaults
+    command: run ingest-consumer --all-consumer-types
+
+  post-process-forwarder:
+    <<: *sentry_defaults
+    command: run post-process-forwarder --commit-batch-size 1
+
+  subscription-consumer-events:
+    <<: *sentry_defaults
+    command: run query-subscription-consumer --commit-batch-size 1 --topic events-subscription-results
+
+  subscription-consumer-transactions:
+    <<: *sentry_defaults
+    command: run query-subscription-consumer --commit-batch-size 1 --topic transactions-subscription-results
+
+  sentry-cron-cleanup:
+    <<: *sentry_defaults
+    command: "gosu sentry sentry cleanup --days $SENTRY_EVENT_RETENTION_DAYS"
+    deploy:
+      mode: replicated
+      replicas: 0
+      labels:
+        - "swarm.cronjob.enable=true"
+        - "swarm.cronjob.schedule=0 0 * * *"
+        - "swarm.cronjob.skip-running=false"
+      restart_policy:
+        condition: none
+
+  relay:
+    image: getsentry/relay:nightly
+    volumes:
+      - type: bind
+        read_only: true
+        source: ./relay
+        target: /work/.relay
+      - type: bind
+        read_only: true
+        source: ./geoip
+        target: /geoip
+    depends_on:
+      - kafka
+      - redis
+      - web
+      - traefik
+    deploy:
+      labels:
+        # TRAEFIK:
+        - traefik.enable=true
+        - traefik.constraint-label=traefik-public
+        # service
+        - traefik.http.services.sentry-relay.loadbalancer.server.port=9000
+        # main router
+        - traefik.http.routers.sentry-relay.rule=Host(`${SENTRY_DOMAIN?Unset}`) && PathPrefix(`/api/store/`, `/api/{id:[1-9]\\d*/}`)
+        - traefik.http.routers.sentry-relay.entrypoints=https
+        - traefik.http.routers.sentry-relay.tls=true
+        - traefik.http.routers.sentry-relay.tls.certresolver=le
+        - traefik.http.routers.sentry-relay.middlewares=gzip
+
+  ############################################################################################
+  # WEBSERVER INGRESS
+
+  traefik:
+    # Use the latest Traefik image
+    image: traefik:2.7
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    deploy:
+      labels:
+        # Enable Traefik for this service, to make it available in the public network
+        - traefik.enable=true
+        # Use the custom label "traefik.constraint-label=traefik-public"
+        # This public Traefik will only use services with this label
+        # That way you can add other internal Traefik instances per stack if needed
+        - traefik.constraint-label=traefik-public
+        # admin-auth middleware with HTTP Basic auth
+        # Using the environment variables USERNAME and HASHED_PASSWORD
+        - traefik.http.middlewares.admin-auth.basicauth.users=admin:${TRAEFIK_HASHED_PASSWORD?Variable TRAEFIK_HASHED_PASSWORD not set}
+        # traefik-http set up only to use the middleware to redirect to https
+        # traefik-https the actual router using HTTPS
+        # Uses the environment variable DOMAIN
+        - traefik.http.routers.traefik-public-https.rule=Host(`${TRAEFIK_DOMAIN?Variable TRAEFIK_DOMAIN not set}`)
+        - traefik.http.routers.traefik-public-https.entrypoints=https
+        - traefik.http.routers.traefik-public-https.tls=true
+        # Use the special Traefik service api@internal with the web UI/Dashboard
+        - traefik.http.routers.traefik-public-https.service=api@internal
+        # Use the "le" (Let's Encrypt) resolver created below
+        - traefik.http.routers.traefik-public-https.tls.certresolver=le
+        # Enable HTTP Basic auth, using the middleware created above
+        - traefik.http.routers.traefik-public-https.middlewares=admin-auth
+        # Define the port inside of the Docker service to use
+        - traefik.http.services.traefik-public.loadbalancer.server.port=8080
+        # GENERIC MIDDLEWARES
+        # https-redirect middleware to redirect HTTP to HTTPS
+        - traefik.http.middlewares.https-redirect.redirectscheme.scheme=https
+        - traefik.http.middlewares.https-redirect.redirectscheme.permanent=true
+        # compress
+        - traefik.http.middlewares.gzip.compress=true
+        - traefik.http.middlewares.gzip.compress.excludedcontenttypes=image/png, image/jpeg, font/woff2
+        # GENERIC ROUTERS
+        # Catchall for http to https with prio match at end
+        - traefik.http.routers.generic-https-redirect.entrypoints=http
+        - traefik.http.routers.generic-https-redirect.rule=HostRegexp(`{host:.*}`)
+        - traefik.http.routers.generic-https-redirect.priority=1
+        - traefik.http.routers.generic-https-redirect.middlewares=https-redirect
+    volumes:
+      # Add Docker as a mounted volume, so that Traefik can read the labels of other services
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Mount the volume to store the certificates
+      - traefik-public-certificates:/certificates
+      # Mount the volume for logs
+      - traefik-access-log:/accesslog
+    command:
+      # Enable Docker in Traefik, so that it reads labels from Docker services
+      - --providers.docker
+      # Add a constraint to only use services with the label "traefik.constraint-label=traefik-public"
+      - --providers.docker.constraints=Label(`traefik.constraint-label`, `traefik-public`)
+      # Do not expose all Docker services, only the ones explicitly exposed
+      - --providers.docker.exposedbydefault=false
+      # Enable Docker Swarm mode
+      - --providers.docker.swarmmode
+      # Create an entrypoint "http" listening on address 80
+      - --entrypoints.http.address=:80
+      # Create an entrypoint "https" listening on address 80
+      - --entrypoints.https.address=:443
+      # Create the certificate resolver "le" for Let's Encrypt, uses the environment variable EMAIL
+      - --certificatesresolvers.le.acme.email=${TRAEFIK_LE_EMAIL?Variable TRAEFIK_LE_EMAIL not set}
+      # Use the staging acme server for initial testing
+      # - "--certificatesresolvers.le.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
+      # Store the Let's Encrypt certificates in the mounted volume
+      - --certificatesresolvers.le.acme.storage=/certificates/acme.json
+      # Use the TLS Challenge for Let's Encrypt
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      # Enable the access log, with HTTP requests
+      - --accesslog=true
+      - --accesslog.filepath=/acccesslog/access.log
+      # Enable the Traefik log, for configurations and errors
+      - --log
+      # optional set to debug
+      #- --log.Level=DEBUG
+      # Enable the Dashboard and API
+      - --api
+
+volumes:
+  # These store application data that should persist across restarts.
+  sentry-data:
+    external: true
+  postgres:
+    external: true
+  redis:
+    external: true
+  zookeeper:
+    external: true
+  kafka:
+    external: true
+  clickhouse:
+    external: true
+  symbolicator:
+    external: true
+  traefik-public-certificates:
+    external: true
+  # These store ephemeral data that needn't persist across restarts.
+  traefik-access-log:
+  kafka-secrets:
+  zookeeper-log:
+  kafka-log:
+  clickhouse-log:
+
+configs:
+  clickhouse:
+    name: clickhouse-config.xml
+    file: ./clickhouse/config.xml
+  symbolicator:
+    name: symbolicator-config.yml
+    file: ./symbolicator/config.yml
+  relay:
+    name: relay-config.yml
+    file: ./relay/config.yml
+  geoip:
+    name: geoip.conf
+    file: ./geoip/geoip.conf
