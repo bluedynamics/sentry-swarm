@@ -151,9 +151,9 @@ services:
       - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:9093
     volumes:
       - "kafka:/bitnami"
-    healthcheck:
-      <<: *healthcheck_defaults
-      test: ["CMD-SHELL", "nc -z localhost 9092"]
+    # healthcheck:
+    #   <<: *healthcheck_defaults
+    #   test: ["CMD-SHELL", "nc -z localhost 9092"]
 
   # kafka:
   #   depends_on:
